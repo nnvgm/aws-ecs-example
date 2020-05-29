@@ -7,10 +7,12 @@ export class CreateTaskDto {
 }
 
 export class CreateServiceDto {
-  serviceName: string;
+  name: string;
   cluster: string;
   desiredCount: number;
   taskDefinition: string;
+  port: string;
+  capacityProvider: string;
 }
 
 export class UpdateServiceStateDto {

@@ -1,5 +1,5 @@
-import { Injectable } from '@nestjs/common';
-import { ECS } from 'aws-sdk';
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { ECS, ELBv2 } from 'aws-sdk';
 
 import {
   CreateTaskDto,
@@ -16,72 +16,123 @@ export class AwsService {
     region: process.env.AWS_REGION,
   });
 
-  createTask(createTaskDto: CreateTaskDto) {
-    const { name, image, tag, containerPort, hostPort } = createTaskDto;
-    const params: ECS.RegisterTaskDefinitionRequest = {
-      containerDefinitions: [
-        {
-          name,
-          cpu: 256,
-          environment: [
-            {
-              name: 'STRING_VALUE',
-              value: 'STRING_VALUE',
-            },
-          ],
-          essential: true,
-          image: `${image}:${tag}`,
-          memory: 1024,
-          portMappings: [
-            {
-              containerPort,
-              hostPort,
-              protocol: 'tcp',
-            },
-          ],
-        },
-      ],
-      family: name,
-      cpu: '256',
-      executionRoleArn: 'arn:aws:iam::256295095336:role/ecsTaskExecutionRole',
-      memory: '1024',
-      networkMode: 'awsvpc',
-      requiresCompatibilities: ['EC2'],
-      taskRoleArn: 'arn:aws:iam::256295095336:role/ecsTaskExecutionRole',
+  private elbv2 = new ELBv2({
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    region: process.env.AWS_REGION,
+  });
+
+  async describeTask(
+    task: string,
+  ): Promise<ECS.DescribeTaskDefinitionResponse> {
+    const params = {
+      taskDefinition: task,
     };
 
-    return new Promise((resolve, reject) => {
-      this.ecs.registerTaskDefinition(params, function(err, data) {
-        if (err) {
-          reject(err);
-        } else {
-          // 1. site =>
-          resolve(data);
-        }
-      });
-    });
+    return await this.ecs.describeTaskDefinition(params).promise();
   }
 
-  createService(createServiceDto: CreateServiceDto) {
-    const {
-      serviceName,
+  async createTask(createTaskDto: CreateTaskDto) {
+    const { name, image, tag, containerPort, hostPort } = createTaskDto;
+
+    const params: ECS.RegisterTaskDefinitionRequest = {
+      family: name,
+      ipcMode: null,
+      executionRoleArn: process.env.AWS_EXE_ROLE_ARN, // env process.env.AWS_EXE_ROLE_ARN
+      containerDefinitions: [
+        {
+          // logConfiguration: {
+          //   logDriver: '',
+          //   secretOptions: null,
+          //   options: {
+          //     'awslogs-group': '',
+          //     'awslogs-region': '',
+          //     'awslogs-stream-prefix': 'ecs',
+          //   },
+          // },
+          portMappings: [
+            {
+              hostPort,
+              protocol: 'tcp',
+              containerPort,
+            },
+          ],
+          cpu: 0,
+          environment: [
+            // env
+          ],
+          repositoryCredentials: {
+            credentialsParameter: process.env.CREDENTIALS_PARAMETER, // token request repository
+          },
+          memoryReservation: 200,
+          image: `${image}:${tag}`, // hard -> env
+          essential: true,
+          name: `${name}-container`, // params
+        },
+      ],
+      taskRoleArn: process.env.AWS_EXE_ROLE_ARN,
+      requiresCompatibilities: ['EC2'],
+      networkMode: 'bridge',
+    };
+
+    return await this.ecs.registerTaskDefinition(params).promise();
+  }
+
+  async getServices(
+    cluster: string,
+    type: string,
+  ): Promise<ECS.ListServicesResponse> {
+    const params = {
       cluster,
-      desiredCount,
-      taskDefinition,
+      launchType: type,
+      maxResults: 50,
+    };
+
+    return await this.ecs.listServices(params).promise();
+  }
+
+  async describeService(
+    cluster: string,
+    service: string,
+  ): Promise<ECS.DescribeServicesResponse> {
+    const params = {
+      cluster,
+      services: [service],
+    };
+
+    return await this.ecs.describeServices(params).promise();
+  }
+
+  async createService(createServiceDto: CreateServiceDto) {
+    const {
+      cluster, // env
+      desiredCount, // 1
+      taskDefinition, // truyen
+      port,
+      name,
+      capacityProvider,
     } = createServiceDto;
+
+    const { TargetGroups } = await this.createTargetGroup(port, `${name}`);
+    const [targetArn] = TargetGroups;
+
+    if (!targetArn) {
+      throw new BadRequestException('Bad Request');
+    }
 
     const params: ECS.CreateServiceRequest = {
       capacityProviderStrategy: [
         {
-          capacityProvider: 'RECRUIT_T2_MICRO',
+          capacityProvider,
           weight: 1,
         },
       ],
-      serviceName, // domain_name
-      cluster, // constant
-      desiredCount, // 1 || 0
+      serviceName: `${name}-svc`, // domain_name_svc
+      cluster, // constant // env
+      desiredCount, // 1 || 0 // 1 = start 0 = off
       placementStrategy: [
         {
+          field: 'memory',
           type: 'binpack',
         },
       ],
@@ -89,43 +140,19 @@ export class AwsService {
       taskDefinition: taskDefinition,
       loadBalancers: [
         {
-          // targetGroupArn: 'ecs-tm3-ec',
-          containerName: 'tm3-dev-api',
-          containerPort: 7000,
-          loadBalancerName: 'toremasse3-dev', // hard
+          containerName: `${name}-container`,
+          containerPort: Number(port),
+          targetGroupArn: targetArn.TargetGroupArn,
         },
       ],
-      // role: 'AWSServiceRoleForECS',
-      // networkConfiguration: {
-      //   awsvpcConfiguration: {
-      //     subnets: [
-      //       /* required */
-      //       'subnet-2a6db901',
-      //       'subnet-6f9c5027',
-      //       'subnet-5079470b',
-      //       /* more items */
-      //     ],
-      //     assignPublicIp: 'DISABLED',
-      //     securityGroups: [
-      //       'sg-0decd463c16862528',
-      //       /* more items */
-      //     ],
-      //   },
-      // },
+      role: process.env.SERVICE_ROLE, // env
+      serviceRegistries: [],
     };
 
-    return new Promise((resolve, reject) => {
-      this.ecs.createService(params, function(err, data) {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(data);
-        }
-      });
-    });
+    return await this.ecs.createService(params).promise();
   }
 
-  updateServiceState(updateServiceDto: UpdateServiceStateDto) {
+  async updateServiceState(updateServiceDto: UpdateServiceStateDto) {
     const { desiredCount, service, cluster } = updateServiceDto;
 
     const params: ECS.UpdateServiceRequest = {
@@ -134,18 +161,12 @@ export class AwsService {
       cluster,
     };
 
-    return new Promise((resolve, reject) => {
-      this.ecs.updateService(params, function(err, data) {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(data);
-        }
-      });
-    });
+    return await this.ecs.updateService(params).promise();
   }
 
-  deleteService(deleteServiceDto: DeleteServiceDto) {
+  async deleteService(
+    deleteServiceDto: DeleteServiceDto,
+  ): Promise<ECS.DeleteServiceResponse> {
     const { service, cluster } = deleteServiceDto;
 
     const params: ECS.DeleteServiceRequest = {
@@ -154,14 +175,26 @@ export class AwsService {
       force: true,
     };
 
-    return new Promise((resolve, reject) => {
-      this.ecs.deleteService(params, function(err, data) {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(data);
-        }
-      });
-    });
+    return await this.ecs.deleteService(params).promise();
+  }
+
+  async createTargetGroup(
+    port: string,
+    name: string,
+  ): Promise<ELBv2.Types.CreateTargetGroupOutput> {
+    const params: ELBv2.Types.CreateTargetGroupInput = {
+      Name: name,
+      Protocol: 'HTTP',
+      Port: Number(port),
+      VpcId: 'vpc-5921223e', // env
+      HealthCheckProtocol: 'HTTP',
+      HealthCheckPort: port,
+      HealthCheckPath: '/',
+      HealthCheckEnabled: true,
+      HealthCheckIntervalSeconds: 30,
+      TargetType: 'ip',
+    };
+
+    return await this.elbv2.createTargetGroup(params).promise();
   }
 }
